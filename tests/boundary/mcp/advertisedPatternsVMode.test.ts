@@ -34,7 +34,7 @@ it("advertises portable NUL escapes and patterns that compile in all JS modes", 
   const session = createTestBinarySession(() => {
     throw new Error("No deep provider may start for a schema projection");
   });
-  const server = createServer(session, session);
+  const server = createServer({ kind: "session", session });
   const client = new Client({ name: "advertised-patterns", version: "1" });
   onTestFinished(async () => {
     await client.close();
@@ -79,9 +79,12 @@ it("advertises portable NUL escapes and patterns that compile in all JS modes", 
   ).toEqual([]);
 
   // DeepSeek rejects the short NUL escape even though V8 accepts it in all
-  // three modes. Schema compilation must not hide that interchange failure.
-  expect(patterns.filter(({ pattern }) => pattern.includes("\\0"))).toEqual([]);
-  expect(patterns.some(({ pattern }) => pattern.includes("\\u0000"))).toBe(
-    true,
-  );
+  // three modes. Keep the shared hex spelling across the advertised catalog;
+  // actual provider acceptance is verified separately from JS compilation.
+  expect(
+    patterns.filter(
+      ({ pattern }) => pattern.includes("\\0") || pattern.includes("\\u0000"),
+    ),
+  ).toEqual([]);
+  expect(patterns.some(({ pattern }) => pattern.includes("\\x00"))).toBe(true);
 });
