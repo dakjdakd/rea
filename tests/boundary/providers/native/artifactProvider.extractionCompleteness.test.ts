@@ -1,11 +1,11 @@
+import { watch } from "node:fs";
 import { access, mkdir, readFile, rm, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 
-import { createPackage } from "@electron/asar";
-import { expect, it, onTestFinished, vi } from "vitest";
+import { createPackage, createPackageWithOptions } from "@electron/asar";
+import { expect, it, onTestFinished } from "vitest";
 
 import { ArtifactProvider } from "../../../../src/artifacts/ArtifactProvider.js";
-import { SafeOutputTree } from "../../../../src/artifacts/SafeOutputTree.js";
 import { artifactExtractionResultSchema } from "../../../../src/domain/artifactGraph.js";
 import { projectAnalysisError } from "../../../../src/domain/analysisErrorProjection.js";
 import { createTestTempDirectory } from "../../../fixtures/temporaryDirectory.js";
@@ -17,10 +17,11 @@ it.each(["file", "directory"] as const)(
     const source = join(root, "source");
     await mkdir(join(source, "z"), { recursive: true });
     // Equal bytes share an artifact node, but both occurrences must be copied.
-    await writeFile(join(source, "a.txt"), "same bytes\n");
-    await writeFile(join(source, "z", "missing.txt"), "same bytes\n");
+    const bytes = Buffer.alloc(8 * 1024 * 1024, "same bytes\n");
+    await writeFile(join(source, "a.txt"), bytes);
+    await writeFile(join(source, "z", "missing.txt"), bytes);
     const output = join(root, "output");
-    afterInventory(async () => {
+    const changed = afterInventory(output, async () => {
       await rm(
         removedKind === "file"
           ? join(source, "z", "missing.txt")
@@ -30,6 +31,7 @@ it.each(["file", "directory"] as const)(
     });
 
     const result = await extract(source, output);
+    await changed();
     if (result.ok) throw new Error("Incomplete extraction must fail");
     expect(projectAnalysisError(result.error)).toMatchObject({
       code: "artifact_operation_failed",
@@ -41,7 +43,7 @@ it.each(["file", "directory"] as const)(
       },
     });
     await expect(access(output)).rejects.toThrow();
-    expect(await readFile(join(source, "a.txt"), "utf8")).toBe("same bytes\n");
+    expect(await readFile(join(source, "a.txt"))).toEqual(bytes);
   },
 );
 
@@ -49,12 +51,16 @@ it("still refuses a regular file added after inventory and rolls back", async ()
   const root = await createTestTempDirectory("rea-extract-added-");
   const source = join(root, "source");
   await mkdir(source);
-  await writeFile(join(source, "a.txt"), "original\n");
+  await writeFile(
+    join(source, "a.txt"),
+    Buffer.alloc(8 * 1024 * 1024, "original\n"),
+  );
   const output = join(root, "output");
-  afterInventory(async () => {
+  const changed = afterInventory(output, async () => {
     await writeFile(join(source, "z.txt"), "new\n");
   });
   const result = await extract(source, output);
+  await changed();
   if (result.ok) throw new Error("Changed inventory must fail");
   expect(projectAnalysisError(result.error)).toMatchObject({
     details: {
@@ -92,18 +98,71 @@ it("preserves every equal-content occurrence and copies a nested ASAR as its con
     );
 });
 
-// Synchronize a real filesystem change after the actual inventory scan. The
-// production reader, writes, failure translation and rollback all remain real.
-const afterInventory = (change: () => Promise<void>): void => {
-  const create = SafeOutputTree.create;
-  const hook = vi
-    .spyOn(SafeOutputTree, "create")
-    .mockImplementationOnce(async (...args) => {
-      const output = await create(...args);
-      await change();
-      return output;
-    });
-  onTestFinished(() => hook.mockRestore());
+it("ignores unavailable members of a nested ASAR but refuses them as active entries", async () => {
+  const root = await createTestTempDirectory("rea-extract-nested-unpacked-");
+  const contents = join(root, "contents");
+  await mkdir(join(contents, "native"), { recursive: true });
+  await writeFile(join(contents, "main.js"), "export default 1;\n");
+  await writeFile(join(contents, "native", "addon.node"), "native bytes\n");
+
+  const source = join(root, "bundle");
+  await mkdir(source);
+  const archive = join(source, "app.asar");
+  await createPackageWithOptions(contents, archive, { unpack: "**/*.node" });
+  await rm(join(`${archive}.unpacked`, "native", "addon.node"));
+
+  const nestedOutput = join(root, "nested-output");
+  const nestedResult = await extract(source, nestedOutput);
+  if (!nestedResult.ok) throw nestedResult.error;
+  const nestedExtraction = artifactExtractionResultSchema.parse(
+    nestedResult.value.result,
+  );
+  expect(
+    nestedExtraction.extraction_manifest.selected_occurrence_ids,
+  ).toHaveLength(1);
+  expect(
+    nestedExtraction.artifacts.map(({ relative_path }) => relative_path),
+  ).toEqual(["app.asar"]);
+  expect(await readFile(join(nestedOutput, "app.asar"))).toEqual(
+    await readFile(archive),
+  );
+
+  const activeOutput = join(root, "active-output");
+  const activeResult = await extract(archive, activeOutput);
+  if (activeResult.ok)
+    throw new Error("Unavailable active ASAR member must fail extraction");
+  expect(projectAnalysisError(activeResult.error)).toMatchObject({
+    code: "artifact_operation_failed",
+    details: {
+      operation: "extract_artifact",
+      reason: "format",
+      detail: expect.stringContaining("native/addon.node"),
+    },
+  });
+  await expect(access(activeOutput)).rejects.toThrow();
+});
+
+// The real destination is created only after inventory. A streamed first file
+// leaves time to mutate a later entry without replacing any production method.
+const afterInventory = (output: string, change: () => Promise<void>) => {
+  let mutation:
+    | Promise<{ ok: true } | { ok: false; cause: unknown }>
+    | undefined;
+  const watcher = watch(dirname(output), (_event, filename) => {
+    if (filename !== basename(output) || mutation !== undefined) return;
+    watcher.close();
+    mutation = change().then(
+      () => ({ ok: true as const }),
+      (cause: unknown) => ({ ok: false as const, cause }),
+    );
+  });
+  onTestFinished(() => watcher.close());
+  return async () => {
+    if (mutation === undefined)
+      throw new Error("Extraction destination was not observed");
+    const result = await mutation;
+    if (!result.ok) throw result.cause;
+  };
 };
 
 const extract = (source: string, output: string) =>
