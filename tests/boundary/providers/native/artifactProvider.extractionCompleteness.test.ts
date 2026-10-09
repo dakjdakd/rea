@@ -43,7 +43,11 @@ it.each(["file", "directory"] as const)(
       },
     });
     await expect(access(output)).rejects.toThrow();
-    expect(await readFile(join(source, "a.txt"))).toEqual(bytes);
+    expect(
+      createHash("sha256")
+        .update(await readFile(join(source, "a.txt")))
+        .digest("hex"),
+    ).toBe(createHash("sha256").update(bytes).digest("hex"));
   },
 );
 
@@ -175,3 +179,4 @@ const extract = (source: string, output: string) =>
       format: "asar",
     })
     .execute("extract_artifact", { output_root: output });
+import { createHash } from "node:crypto";
