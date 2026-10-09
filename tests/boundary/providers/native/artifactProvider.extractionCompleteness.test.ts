@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { watch } from "node:fs";
 import { access, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
@@ -33,15 +34,28 @@ it.each(["file", "directory"] as const)(
     const result = await extract(source, output);
     await changed();
     if (result.ok) throw new Error("Incomplete extraction must fail");
-    expect(projectAnalysisError(result.error)).toMatchObject({
+    const projected = projectAnalysisError(result.error);
+    expect(projected).toMatchObject({
       code: "artifact_operation_failed",
       details: {
         operation: "extract_artifact",
+      },
+    });
+    // A directory already returned by readdir can disappear before its stat.
+    // That earlier reader failure retains ENOENT instead of reaching the final
+    // completeness check. Both paths must reject publication and roll back.
+    if (removedKind === "directory" && projected.details?.reason === "io") {
+      expect(projected.details).toMatchObject({
+        reason: "io",
+        detail: `Could not inspect entry at ${join(source, "z")} (ENOENT)`,
+      });
+    } else {
+      expect(projected.details).toMatchObject({
         reason: "integrity",
         detail:
           "Inventoried regular artifact entries were not materialized: z/missing.txt",
-      },
-    });
+      });
+    }
     await expect(access(output)).rejects.toThrow();
     expect(
       createHash("sha256")
@@ -179,4 +193,3 @@ const extract = (source: string, output: string) =>
       format: "asar",
     })
     .execute("extract_artifact", { output_root: output });
-import { createHash } from "node:crypto";
