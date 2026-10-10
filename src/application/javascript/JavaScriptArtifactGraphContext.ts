@@ -1,4 +1,5 @@
 import type { ArtifactInventorySnapshot } from "../../domain/artifactInventorySnapshot.js";
+import { compositeKey } from "../../domain/unicodeCodePointOrder.js";
 import {
   completeApplicationCoverage,
   partialApplicationCoverage,
@@ -322,15 +323,18 @@ export const selfReferenceOmissions = (
       ];
 
 /** Deterministic key for one recovered module inside a bundle asset. */
-export const moduleLookupKey = (path: string, moduleKey: string): string =>
-  `${path}\0${moduleKey}`;
+export const moduleLookupKey = (
+  path: string,
+  runtime: string,
+  moduleKey: string,
+): string => compositeKey([path, runtime, moduleKey]);
 
 /** Deterministic key for one recovered bundler chunk inside a bundle asset. */
 export const chunkLookupKey = (
   path: string,
   runtime: string,
   chunkKey: string,
-): string => `${path}\0${runtime}\0${chunkKey}`;
+): string => compositeKey([path, runtime, chunkKey]);
 
 /** Resolve a relative static specifier without escaping the artifact root. */
 export const resolveArtifactPath = (
@@ -352,7 +356,10 @@ export const sourceNodeFor = (
   context: JavaScriptArtifactGraphContext,
   path: string,
   moduleKey: string | null,
+  runtime?: string,
 ): ApplicationNode | undefined =>
   moduleKey === null
     ? context.sourceModuleNodes.get(path)
-    : context.moduleNodes.get(moduleLookupKey(path, moduleKey));
+    : runtime === undefined
+      ? undefined
+      : context.moduleNodes.get(moduleLookupKey(path, runtime, moduleKey));

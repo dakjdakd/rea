@@ -156,7 +156,7 @@ const addBundlerModuleNodes = (
       ],
     });
     context.moduleNodes.set(
-      moduleLookupKey(file.path, moduleValue.module_key),
+      moduleLookupKey(file.path, registration.runtime, moduleValue.module_key),
       module,
     );
     addAstContainsEdge(context, {
@@ -190,7 +190,7 @@ const addBundlerRuntimeEdges = (
   const { file, registration, chunk, coverage } = record;
   for (const moduleKey of registration.entry_module_keys) {
     const resolved = context.moduleNodes.get(
-      moduleLookupKey(file.path, moduleKey),
+      moduleLookupKey(file.path, registration.runtime, moduleKey),
     );
     const target =
       resolved ?? unresolvedBundlerModuleNode(context, record, moduleKey);
