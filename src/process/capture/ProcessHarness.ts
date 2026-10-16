@@ -272,6 +272,7 @@ const startCaptureRuntime = async (
       scenario.executable,
       options.signal,
     );
+    assertNotCancelled(options.signal);
     const startedAt = new Date();
     const started = monotonicProcessCaptureClock();
     let lastOutput = started;
