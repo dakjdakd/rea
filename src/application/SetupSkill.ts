@@ -1,7 +1,6 @@
-import { copyFile, lstat, mkdir, readFile, rm } from "node:fs/promises";
-import { constants as fsConstants } from "node:fs";
+import { copyFile, lstat, mkdir, readFile } from "node:fs/promises";
+import { constants as fsConstants, type Stats } from "node:fs";
 import { dirname, join } from "node:path";
-import writeFileAtomic from "write-file-atomic";
 import { err, ok, type Result } from "../domain/result.js";
 import { readBoundedFileBytes } from "../process/BoundedFileBytes.js";
 import type { ArtifactResourceScope } from "../artifacts/ArtifactResourceScope.js";
@@ -18,6 +17,11 @@ import {
 } from "./RegularFileRead.js";
 import { clientSkillDirectories } from "./SupportedClients.js";
 import { preserveCurrentRecoveryBackup } from "./SetupRecoveryBackup.js";
+import { ClientConfigurationPublication } from "./ClientConfigurationPublication.js";
+import {
+  isClientConfigurationCleanupFailure,
+  retryClientConfigurationCleanup,
+} from "./ClientConfigurationCleanup.js";
 
 export const MANAGED_SKILL_FILES = [
   "SKILL.md",
@@ -44,6 +48,7 @@ export const readSkillFile = (
 interface SkillFileState {
   readonly bytes: Buffer;
   readonly mode: number;
+  readonly stats: Stats;
 }
 
 const readSkillFileState = async (
@@ -58,7 +63,7 @@ const readSkillFileState = async (
       });
       if (bytes === undefined || bytes.length !== stats.size)
         throw new RegularFileChangedError(path);
-      return { bytes, mode: stats.mode & 0o7777 };
+      return { bytes, mode: stats.mode & 0o7777, stats };
     },
     {
       symlinks: "reject",
@@ -88,9 +93,14 @@ export interface SkillInstallFileOperations {
     path: string,
     content: string | Buffer,
     mode: number,
-  ) => Promise<void>;
-  readonly remove: (path: string) => Promise<void>;
+    original: SkillFileState | undefined,
+  ) => Promise<SkillFilePublication>;
 }
+
+type SkillFilePublication = Pick<
+  ClientConfigurationPublication,
+  "assertCurrent" | "restore" | "verify"
+>;
 
 export interface SkillInstallRollbackFailure {
   readonly path: string;
@@ -136,7 +146,7 @@ export class SetupSkillInstallError extends Error {
   }
 
   get remediation(): string {
-    return `${this.message} Check permissions and rerun setup.`;
+    return `${this.message} Review the current skill files and retained backups, resolve any concurrent changes or permission failures, then rerun setup.`;
   }
 }
 
@@ -146,15 +156,20 @@ export type SkillInstallResult = Result<
   SetupSkillInstallError
 >;
 
-const systemSkillInstallFileOperations: SkillInstallFileOperations = {
+export const systemSkillInstallFileOperations: SkillInstallFileOperations = {
   mkdir: async (path) => {
     await mkdir(path, { recursive: true });
   },
   backup: (source, destination) =>
     copyFile(source, destination, fsConstants.COPYFILE_EXCL),
-  write: (path, content, mode) =>
-    writeFileAtomic(path, content, { encoding: "utf8", mode }),
-  remove: (path) => rm(path, { force: true }),
+  write: (path, content, mode, original) =>
+    ClientConfigurationPublication.write(
+      path,
+      content,
+      original?.bytes,
+      mode,
+      original?.stats,
+    ),
 };
 
 /** Managed skill location selected for a client family. */
@@ -487,20 +502,60 @@ const causePath = (cause: unknown): string | undefined =>
     ? cause.path
     : undefined;
 
+interface AttemptedSkillFile {
+  readonly file: CanonicalSkillFile;
+  readonly publication: SkillFilePublication;
+}
+
 const restoreSkillFiles = async (
-  attempted: readonly CanonicalSkillFile[],
-  operations: SkillInstallFileOperations,
+  attempted: readonly AttemptedSkillFile[],
 ): Promise<readonly SkillInstallRollbackFailure[]> => {
   const failures: SkillInstallRollbackFailure[] = [];
-  for (const { destination, original } of [...attempted].reverse()) {
+  for (const { file, publication } of [...attempted].reverse()) {
+    const { destination, original } = file;
     try {
-      if (original === undefined) await operations.remove(destination);
-      else await operations.write(destination, original.bytes, original.mode);
+      await publication.restore(original?.bytes);
     } catch (cause: unknown) {
       failures.push({ path: destination, reason: causeReason(cause) });
     }
   }
   return failures;
+};
+
+const releaseSkillFiles = async (
+  attempted: readonly AttemptedSkillFile[],
+  result: SkillInstallResult,
+  resources?: ArtifactResourceScope,
+): Promise<SkillInstallResult> => {
+  const release = (index: number): Promise<SkillInstallResult> => {
+    const current = attempted[index];
+    return current === undefined
+      ? Promise.resolve(result)
+      : current.publication.verify(() => release(index + 1));
+  };
+  try {
+    return await release(0);
+  } catch (cause: unknown) {
+    if (resources !== undefined && isClientConfigurationCleanupFailure(cause)) {
+      const retry = await retryClientConfigurationCleanup(cause, resources);
+      if (retry.cleanup === undefined) return result;
+    }
+    if (!result.ok && cause instanceof Error)
+      return err(
+        new SetupSkillInstallError({
+          path: causePath(cause) ?? "skill bundle",
+          stage: result.error.stage,
+          reason: result.error.reason,
+          rollbackFailures: [
+            ...result.error.rollbackFailures,
+            { path: causePath(cause) ?? "skill bundle", reason: cause.message },
+          ],
+          recoveryBackupPaths: result.error.recoveryBackupPaths,
+          cause: result.error,
+        }),
+      );
+    throw cause;
+  }
 };
 
 /** Transactionally install the canonical skill bundle and optional references. */
@@ -512,10 +567,11 @@ export const installCanonicalSkill = async (
   operations: SkillInstallFileOperations = systemSkillInstallFileOperations,
   resources?: ArtifactResourceScope,
 ): Promise<SkillInstallResult> => {
-  let attempted: CanonicalSkillFile[] = [];
+  const attempted: AttemptedSkillFile[] = [];
   let stage: "prepare" | "backup" | "write" | "readback" = "prepare";
   let failingPath = "skill bundle";
   const recoveryPaths = new Map<string, string>();
+  let result: SkillInstallResult;
   try {
     const canonical = await canonicalSkillFiles(
       home,
@@ -551,17 +607,19 @@ export const installCanonicalSkill = async (
     stage = "write";
     for (const file of changed) {
       failingPath = file.destination;
-      // An atomic writer can publish and then reject; include the target before
-      // entering it so rollback covers that ambiguous outcome.
-      attempted.push(file);
-      await operations.write(
+      const publication = await operations.write(
         file.destination,
         file.content,
         file.original?.mode ?? 0o600,
+        file.original,
       );
+      attempted.push({ file, publication });
     }
     stage = "readback";
-    for (const { destination, content } of changed) {
+    for (const {
+      file: { destination, content },
+      publication,
+    } of attempted) {
       failingPath = destination;
       if (
         !(await readSkillFileState(destination, resources)).bytes.equals(
@@ -569,28 +627,33 @@ export const installCanonicalSkill = async (
         )
       )
         throw new Error(`skill readback mismatch: ${destination}`);
+      await publication.assertCurrent();
     }
-    return ok("installed");
+    result = ok("installed");
   } catch (cause: unknown) {
+    let primary = cause;
+    if (isClientConfigurationCleanupFailure(cause) && resources !== undefined) {
+      const retry = await retryClientConfigurationCleanup(cause, resources);
+      if (retry.cleanup === undefined) primary = retry.primary;
+    }
     if (stage === "prepare" && cause instanceof SetupSkillInstallError)
       return err(cause);
     failingPath = causePath(cause) ?? failingPath;
-    const rollbackFailures = await restoreSkillFiles(attempted, operations);
-    return err(
+    const rollbackFailures = await restoreSkillFiles(attempted);
+    result = err(
       new SetupSkillInstallError({
         path: failingPath,
         stage,
-        reason: causeReason(cause),
+        reason: causeReason(primary),
         rollbackFailures,
-        recoveryBackupPaths: attempted.flatMap(({ destination, original }) =>
-          original === undefined || recoveryPaths.get(destination) === undefined
-            ? []
-            : [recoveryPaths.get(destination)!],
-        ),
+        recoveryBackupPaths: [...recoveryPaths.values()],
         cause,
       }),
     );
   }
+  // Keep every staged descriptor alive until bundle verification or rollback
+  // has settled, and retain that outcome if any cleanup owner fails to release.
+  return releaseSkillFiles(attempted, result, resources);
 };
 
 /** Read installed skill metadata and compare every managed location. */

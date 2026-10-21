@@ -256,6 +256,13 @@ export const readRegularFileTextSnapshot = (
     options,
   );
 
+/** Retain the read owner's verified file state together with its exact bytes. */
+export const readRegularFileSnapshot = (
+  path: string,
+  options: RegularFileReadOptions = {},
+): Promise<{ readonly bytes: Buffer; readonly state: Stats }> =>
+  readRegularFileContent(path, (bytes, state) => ({ bytes, state }), options);
+
 const decodeFileText = (path: string, bytes: Buffer): string => {
   try {
     return new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(

@@ -209,6 +209,24 @@ it("accepts a literal UTF-8 replacement character without changing its value", a
   expect(JSON.parse(await readFile(configPath, "utf8")).label).toBe("\uFFFD");
 });
 
+it("keeps an existing UTF-8 BOM while publishing the updated configuration", async () => {
+  const root = await createTestTempDirectory("rea-client-config-bom-");
+  const configPath = join(root, "config.json");
+  const original = Buffer.concat([
+    Buffer.from([0xef, 0xbb, 0xbf]),
+    Buffer.from('{"keep":true}\n'),
+  ]);
+  await writeFile(configPath, original);
+  const result = await configureClientConfiguration(
+    { name: "cursor", configPath, format: "json" },
+    {},
+    ["rea", "mcp"],
+  );
+  expect(result.status).toBe("configured");
+  expect(await readFile(`${configPath}.rea.backup`)).toEqual(original);
+  expect((await readFile(configPath))[0]).toBe(0xef);
+});
+
 it("previews and creates a current recovery backup while preserving the first backup", async () => {
   const root = await createTestTempDirectory("rea-client-current-recovery-");
   const configPath = join(root, "config.json");

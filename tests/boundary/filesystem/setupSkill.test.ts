@@ -24,6 +24,7 @@ import {
   installCanonicalSkill,
   readInstalledSkillIdentity,
   skillDestinations,
+  systemSkillInstallFileOperations,
   type SkillInstallFileOperations,
 } from "../../../src/application/SetupSkill.js";
 import {
@@ -33,7 +34,6 @@ import {
 import { createDoctorHostFixture } from "../../../src/application/Doctor.fixture.js";
 import { TOOL_CONTRACTS } from "../../../src/contracts/toolContracts.js";
 import { PRODUCT_IDENTITY } from "../../../src/identity.js";
-import writeFileAtomic from "write-file-atomic";
 import { z } from "zod";
 import { skillReferenceIssues } from "../../../scripts/lib/docs-facts.mjs";
 
@@ -61,9 +61,7 @@ describe("skill recovery backup selection", () => {
       backup: async () => {
         throw new Error("A matching backup must not be copied again");
       },
-      write: (path, content, mode) =>
-        writeFileAtomic(path, content, { encoding: "utf8", mode }),
-      remove: async (path) => rm(path, { force: true }),
+      write: systemSkillInstallFileOperations.write,
     });
 
     expect(result).toEqual({ ok: true, value: "installed" });
@@ -81,20 +79,26 @@ describe("skill recovery backup selection", () => {
     await mkdir(dirname(manifest), { recursive: true });
     await writeFile(manifest, current);
     await writeFile(`${manifest}.rea.backup`, oldSnapshot);
-    let manifestWrites = 0;
     const operations: SkillInstallFileOperations = {
       mkdir: async (path) =>
         mkdir(path, { recursive: true }).then(() => undefined),
       backup: async (source, target) =>
         copyFile(source, target, fsConstants.COPYFILE_EXCL),
-      write: async (path, content, mode) => {
-        if (path === manifest && ++manifestWrites === 2)
-          throw new Error("injected rollback failure");
-        await writeFileAtomic(path, content, { encoding: "utf8", mode });
-        if (path === manifest && manifestWrites === 1)
-          throw new Error("injected failure after publication");
+      write: async (...args) => {
+        const publication = await systemSkillInstallFileOperations.write(
+          ...args,
+        );
+        if (args[0] !== manifest) return publication;
+        return {
+          verify: publication.verify.bind(publication),
+          assertCurrent: async () => {
+            throw new Error("injected readback failure");
+          },
+          restore: async () => {
+            throw new Error("injected rollback failure");
+          },
+        };
       },
-      remove: async (path) => rm(path, { force: true }),
     };
 
     const result = await installCanonicalSkill(
@@ -106,9 +110,11 @@ describe("skill recovery backup selection", () => {
     );
 
     if (result.ok) throw new Error("Expected the injected write failure");
-    expect(result.error.rollbackFailures).toEqual([
-      { path: manifest, reason: "injected rollback failure" },
-    ]);
+    expect(result.error.rollbackFailures).toEqual(
+      expect.arrayContaining([
+        { path: manifest, reason: "injected rollback failure" },
+      ]),
+    );
     const recovery = result.error.recoveryBackupPaths.find((path) =>
       path.startsWith(`${manifest}.rea.backup.`),
     );
@@ -130,20 +136,26 @@ describe("skill recovery byte preservation", () => {
     await mkdir(dirname(manifest), { recursive: true });
     await writeFile(manifest, original);
     await writeFile(firstBackup, "historical instructions V0\n");
-    let manifestWrites = 0;
     const result = await installCanonicalSkill(home, [], {}, process.platform, {
       mkdir: async (path) =>
         mkdir(path, { recursive: true }).then(() => undefined),
       backup: async (source, target) =>
         copyFile(source, target, fsConstants.COPYFILE_EXCL),
-      write: async (path, content, mode) => {
-        if (path === manifest && ++manifestWrites === 2)
-          throw new Error("injected rollback failure");
-        await writeFileAtomic(path, content, { encoding: "utf8", mode });
-        if (path === manifest && manifestWrites === 1)
-          throw new Error("injected failure after publication");
+      write: async (...args) => {
+        const publication = await systemSkillInstallFileOperations.write(
+          ...args,
+        );
+        if (args[0] !== manifest) return publication;
+        return {
+          verify: publication.verify.bind(publication),
+          assertCurrent: async () => {
+            throw new Error("injected readback failure");
+          },
+          restore: async () => {
+            throw new Error("injected rollback failure");
+          },
+        };
       },
-      remove: async (path) => rm(path, { force: true }),
     });
     if (result.ok) throw new Error("Expected the injected write failure");
     expect(result.error.recoveryBackupPaths).toContain(recovery);
@@ -278,6 +290,141 @@ describe("skill directory admission", () => {
   );
 });
 
+describe("canonical skill publication ownership", () => {
+  it("preserves an edit made after backup preparation instead of publishing over it", async () => {
+    const home = await createTestTempDirectory("rea-skill-write-conflict-");
+    const [destination] = skillDestinations(home, []);
+    if (destination === undefined) throw new Error("Missing shared skill root");
+    const manifest = join(destination.path, "SKILL.md");
+    const connection = join(
+      destination.path,
+      "references/connection-and-recovery.md",
+    );
+    await mkdir(dirname(connection), { recursive: true });
+    await writeFile(manifest, "old manifest\n");
+    await writeFile(connection, "old connection\n");
+    const result = await installCanonicalSkill(home, [], {}, process.platform, {
+      ...systemSkillInstallFileOperations,
+      write: async (...args) => {
+        const publication = await systemSkillInstallFileOperations.write(
+          ...args,
+        );
+        if (args[0] === manifest)
+          await writeFile(connection, "concurrent user edit\n");
+        return publication;
+      },
+    });
+    if (result.ok) throw new Error("Expected concurrent edit refusal");
+    expect(result.error.stage).toBe("write");
+    expect(result.error.path).toBe(connection);
+    expect(result.error.rollbackFailures).toEqual([]);
+    expect(await readFile(connection, "utf8")).toBe("concurrent user edit\n");
+    expect(await readFile(manifest, "utf8")).toBe("old manifest\n");
+    expect(await readFile(`${connection}.rea.backup`, "utf8")).toBe(
+      "old connection\n",
+    );
+  });
+
+  it.each(["edit", "same-content replacement"] as const)(
+    "preserves a concurrent %s of an already published file during rollback",
+    async (change) => {
+      const home = await createTestTempDirectory(
+        "rea-skill-rollback-conflict-",
+      );
+      const [destination] = skillDestinations(home, []);
+      if (destination === undefined)
+        throw new Error("Missing shared skill root");
+      const manifest = join(destination.path, "SKILL.md");
+      const connection = join(
+        destination.path,
+        "references/connection-and-recovery.md",
+      );
+      await mkdir(dirname(connection), { recursive: true });
+      await writeFile(manifest, "old manifest\n");
+      let retained = "concurrent user edit\n";
+      const result = await installCanonicalSkill(
+        home,
+        [],
+        {},
+        process.platform,
+        {
+          ...systemSkillInstallFileOperations,
+          write: async (...args) => {
+            if (args[0] === connection) {
+              if (change === "same-content replacement") {
+                retained = await readFile(manifest, "utf8");
+                const replacement = join(home, "replacement");
+                await writeFile(replacement, retained);
+                await rename(manifest, join(home, "retained-published-file"));
+                await rename(replacement, manifest);
+              } else await writeFile(manifest, retained);
+              throw new Error("injected write failure");
+            }
+            return systemSkillInstallFileOperations.write(...args);
+          },
+        },
+      );
+      if (result.ok) throw new Error("Expected injected write failure");
+      expect(result.error.rollbackFailures).toEqual([
+        { path: manifest, reason: expect.stringContaining("changed") },
+      ]);
+      expect(await readFile(manifest, "utf8")).toBe(retained);
+      expect(result.error.recoveryBackupPaths).toContain(
+        `${manifest}.rea.backup`,
+      );
+      expect(await readFile(`${manifest}.rea.backup`, "utf8")).toBe(
+        "old manifest\n",
+      );
+    },
+  );
+
+  it("restores exact original bytes through the owned descriptor after a later write fails", async () => {
+    const home = await createTestTempDirectory("rea-skill-owned-rollback-");
+    const [destination] = skillDestinations(home, []);
+    if (destination === undefined) throw new Error("Missing shared skill root");
+    const manifest = join(destination.path, "SKILL.md");
+    const original = Buffer.from([0xff, 0xfe, 0x61]);
+    await mkdir(dirname(manifest), { recursive: true });
+    await writeFile(manifest, original, { mode: 0o640 });
+    const result = await installCanonicalSkill(home, [], {}, process.platform, {
+      ...systemSkillInstallFileOperations,
+      write: async (...args) => {
+        if (args[0] !== manifest)
+          throw new Error("injected later write failure");
+        return systemSkillInstallFileOperations.write(...args);
+      },
+    });
+    if (result.ok) throw new Error("Expected injected write failure");
+    expect(result.error.rollbackFailures).toEqual([]);
+    expect(await readFile(manifest)).toEqual(original);
+    await expectPermissionMode(manifest, 0o640);
+  });
+
+  it("does not delete a first-install file replaced before rollback", async () => {
+    const home = await createTestTempDirectory(
+      "rea-skill-first-install-conflict-",
+    );
+    const [destination] = skillDestinations(home, []);
+    if (destination === undefined) throw new Error("Missing shared skill root");
+    const manifest = join(destination.path, "SKILL.md");
+    const result = await installCanonicalSkill(home, [], {}, process.platform, {
+      ...systemSkillInstallFileOperations,
+      write: async (...args) => {
+        if (args[0] !== manifest) {
+          await writeFile(manifest, "new user file\n");
+          throw new Error("injected later write failure");
+        }
+        return systemSkillInstallFileOperations.write(...args);
+      },
+    });
+    if (result.ok) throw new Error("Expected injected write failure");
+    expect(result.error.rollbackFailures).toEqual([
+      { path: manifest, reason: expect.stringContaining("manual removal") },
+    ]);
+    expect(await readFile(manifest, "utf8")).toBe("new user file\n");
+  });
+});
+
 describe("canonical skill transaction", () => {
   it("does not roll back files when backup preparation fails", async () => {
     const home = await createTestTempDirectory("rea-skill-backup-failure-");
@@ -300,11 +447,10 @@ describe("canonical skill transaction", () => {
         if (backups === 2) throw new Error("injected backup failure");
         await copyFile(source, target, fsConstants.COPYFILE_EXCL);
       },
-      write: async (path, content, mode) => {
-        writes.push(path);
-        await writeFile(path, content, { mode });
+      write: async (...args) => {
+        writes.push(args[0]);
+        return systemSkillInstallFileOperations.write(...args);
       },
-      remove: async (path) => rm(path, { force: true }),
     };
 
     const result = await installCanonicalSkill(
@@ -343,7 +489,6 @@ describe("canonical skill transaction", () => {
     await writeFile(manifest, "old manifest\n", { mode: 0o640 });
     await writeFile(connection, "old connection\n", { mode: 0o644 });
     await writeFile(native, "old native\n", { mode: 0o600 });
-    const writes = new Map<string, number>();
     const nativeWrites: (string | Buffer)[] = [];
     const operations: SkillInstallFileOperations = {
       mkdir: async (path) => {
@@ -351,17 +496,23 @@ describe("canonical skill transaction", () => {
       },
       backup: async (source, target) =>
         copyFile(source, target, fsConstants.COPYFILE_EXCL),
-      write: async (path, content, mode) => {
-        const attempt = (writes.get(path) ?? 0) + 1;
-        writes.set(path, attempt);
-        if (path === native) nativeWrites.push(content);
-        if (path === native && attempt === 2)
-          throw new Error("injected rollback failure");
-        await writeFileAtomic(path, content, { encoding: "utf8", mode });
-        if (path === native && attempt === 1)
-          throw new Error("injected ambiguous publication failure");
+      write: async (...args) => {
+        const publication = await systemSkillInstallFileOperations.write(
+          ...args,
+        );
+        if (args[0] !== native) return publication;
+        nativeWrites.push(args[1]);
+        return {
+          verify: publication.verify.bind(publication),
+          assertCurrent: async () => {
+            throw new Error("injected readback failure");
+          },
+          restore: async (original) => {
+            if (original !== undefined) nativeWrites.push(original);
+            throw new Error("injected rollback failure");
+          },
+        };
       },
-      remove: async (path) => rm(path, { force: true }),
     };
 
     const result = await installCanonicalSkill(
@@ -373,11 +524,13 @@ describe("canonical skill transaction", () => {
     );
 
     if (result.ok) throw new Error("Expected write failure");
-    expect(result.error.stage).toBe("write");
+    expect(result.error.stage).toBe("readback");
     expect(result.error.path).toBe(native);
-    expect(result.error.rollbackFailures).toEqual([
-      { path: native, reason: "injected rollback failure" },
-    ]);
+    expect(result.error.rollbackFailures).toEqual(
+      expect.arrayContaining([
+        { path: native, reason: "injected rollback failure" },
+      ]),
+    );
     expect(result.error.recoveryBackupPaths).toEqual([
       `${manifest}.rea.backup`,
       `${connection}.rea.backup`,
